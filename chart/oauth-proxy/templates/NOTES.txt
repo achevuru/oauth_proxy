@@ -1,0 +1,7 @@
+Thank you for installing {{ include "oauth-proxy.fullname" . }}.
+
+This deployment exposes the proxy on port {{ .Values.service.port }}. You can access it by running:
+
+  kubectl port-forward svc/{{ include "oauth-proxy.fullname" . }} 8080:{{ .Values.service.port }}
+
+Remember to configure the required settings (tenantId, clientId, redirectUri, and sessionSecret) before deploying.
