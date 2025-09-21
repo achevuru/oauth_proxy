@@ -36,119 +36,94 @@ Non-goals (initially): full multi-cluster brokering, long-lived refresh token sy
 
 ### 3.2. Acquire user-scoped AKS token
 
-Rebuild the MSAL client with the same cache and call the AKS token acquisition flow.
+Rebuild the MSAL client with the same cache and call the AKS token acquisition flow:
 
-Rebuild MSAL client with the same cache and call:
-
+```python
 acquire_token_silent(["6dae42f8-4368-4678-94ff-3960e28e3630/.default"], account=<by home_account_id>)
+```
 
-If silent returns None → do a one-time incremental consent redirect for the AKS scope and repeat silent after callback.
-(If you pre-grant the app the AKS delegated permission user_impersonation, silent works immediately—no consent hop.)
+If silent returns `None`, do a one-time incremental consent redirect for the AKS scope and repeat the silent call after the callback. (If you pre-grant the app the AKS delegated permission `user_impersonation`, silent works immediately—no consent hop.)
 
-### 3.3 Call Kubernetes API / kubectl (as the user)
+### 3.3. Call Kubernetes API / `kubectl` (as the user)
 
 From a pod, either:
 
-Use in-cluster endpoint with cluster CA and --token $AKS_USER_TOKEN, or
+- Use the in-cluster endpoint with the cluster CA and `--token $AKS_USER_TOKEN`, or
+- Use a kubeconfig with embedded CA and override the user token.
 
-Use kubeconfig with embedded CA and override the user token.
+AKS validates TLS first, then validates your Entra JWT (`aud=AKS`, issuer=tenant, signature). RBAC is evaluated on the user identity in the token.
 
-AKS validates TLS first, then validates your Entra JWT (aud=AKS, issuer=tenant, signature). RBAC is evaluated on the user identity in the token.
+## 4. Endpoints (MVP)
 
-### 4. Endpoints (MVP)
+- `GET /login` → start OIDC sign-in.
+- `GET /callback?code=&state=` → finish OIDC or AKS-consent step; on success, cache has user + refresh; try silent AKS token; store `aks_token` in session.
+- `GET /whoami` → return decoded AKS token claims (`aud`/`iss`/`oid`/`upn`/`idtyp`).
+- `POST /kubectl` (optional) → execute a whitelisted `kubectl` (e.g., `auth can-i`, `get pods -n <ns>`), injecting `--token $AKS_USER_TOKEN` and the correct CA.
+- `POST /api/k8s/*` (optional) → direct API calls proxied with `Authorization: Bearer <AKS_USER_TOKEN>`.
 
-GET /login → start OIDC sign-in.
+## 5. Session & token cache
 
-GET /callback?code=&state= → finish OIDC or AKS-consent step; on success, cache has user + refresh; try silent AKS token; store aks_token in session.
-
-GET /whoami → return decoded AKS token claims (aud/iss/oid/upn/idtyp).
-
-POST /kubectl (optional) → execute a whitelisted kubectl (e.g., auth can-i, get pods -n <ns>), injecting --token $AKS_USER_TOKEN and correct CA.
-
-POST /api/k8s/* (optional) → direct API calls proxied with Authorization: Bearer <AKS_USER_TOKEN>.
-
-### 5. Session & token cache
-
-Server-side sessions (cookie only holds a random sid; session state in process or Redis).
+Server-side sessions (cookie only holds a random SID; session state in process or Redis).
 
 Store:
 
-home_account_id, upn, oid, timestamps
+- `home_account_id`, UPN, OID, timestamps
+- MSAL cache blob (serialized) per session
+- `aks_token` (short-lived; may be re-acquired silently)
+- Idle timeout (e.g., 30 min); absolute lifetime (e.g., 8 hrs). Rotate session ID at login.
 
-MSAL cache blob (serialized) per session
+## 6. Consent model
 
-aks_token (short-lived; may be re-acquired silently)
+Preferred: pre-grant AKS delegated permission to your client app (App Registration → API permissions → Azure Kubernetes Service AAD Server → Delegated → `user_impersonation` → Grant admin consent). Then `/.default` is silent.
 
-Idle timeout (e.g., 30 min); absolute lifetime (e.g., 8 hrs). Rotate session ID at login.
+Otherwise: handle incremental consent once—if silent fails, redirect with `scopes=[AKS_APP/.default]` + `prompt=consent`. After callback, future silent works. (This mirrors Microsoft’s guidance on incremental consent & “UI required” paths.)
 
-### 6. Consent model
+## 7. Workload Identity (confidential client with `client_assertion`)
 
-Preferred: pre-grant AKS delegated permission to your client app (App Reg → API permissions → Azure Kubernetes Service AAD Server → Delegated → user_impersonation → Grant admin consent). Then /.default is silent.
+Pod has `AZURE_FEDERATED_TOKEN_FILE`. Read it and set:
 
-Otherwise: handle incremental consent once—if silent fails, redirect with scopes=[AKS_APP/.default] + prompt=consent. After callback, future silent works. (This mirrors Microsoft’s guidance on incremental consent & “UI required” paths.) 
-GitHub
-
-### 7. Workload Identity (confidential client w/ client_assertion)
-
-Pod has AZURE_FEDERATED_TOKEN_FILE. Read it and set:
-
-client_credential={
+```python
+client_credential = {
   "client_assertion": <file contents>,
-  "client_assertion_type":"urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+  "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 }
+```
 
-### 8. TLS & kube access
+## 8. TLS & kube access
 
-If calling the in-cluster API endpoint: pass --certificate-authority /var/run/secrets/kubernetes.io/serviceaccount/ca.crt.
+- If calling the in-cluster API endpoint: pass `--certificate-authority /var/run/secrets/kubernetes.io/serviceaccount/ca.crt`.
+- If using the public FQDN: ensure your container has `ca-certificates` (or use kubeconfig with embedded CA).
+- The token’s audience must be the AKS server app (`6dae42f8-4368-4678-94ff-3960e28e3630`). Tools like `kubelogin`/exec-plugin do the same thing under the hood, targeting that server ID.
 
-If using the public FQDN: ensure your container has ca-certificates (or use kubeconfig with embedded CA).
+## 9. Security notes
 
-The token’s audience must be AKS server app (6dae42f8-4368-4678-94ff-3960e28e3630).
-Tools like kubelogin/exec-plugin do the same thing under the hood, targeting that server ID. 
-Azure
-+2
-GitHub
-+2
+- Cookies: `HttpOnly`, `Secure`, `SameSite=Lax` (or `Strict`); rotate at login.
+- Never send refresh/access tokens to the browser; keep them server-side.
+- Validate `state` (and `nonce` if you add it) on callback.
+- Limit `kubectl` to a safe allowlist of subcommands/flags.
+- Log request IDs + user OID (not raw tokens) for audit.
 
-### 9. Security notes
+## 10. Rate limiting (optional MVP)
 
-Cookies: HttpOnly, Secure, SameSite=Lax (or Strict), rotate at login.
+Per-user sliding window (e.g., 60 requests/min). Key on `home_account_id`. Store counters in Redis or in-process if single-instance.
 
-Never send refresh/access tokens to the browser; keep them server-side.
+## 11. Config (env)
 
-Validate state (and nonce if you add it) on callback.
+- `TENANT_ID`, `CLIENT_ID`, `REDIRECT_URI`
+- `AZURE_FEDERATED_TOKEN_FILE`
+- `SESSION_SECRET`
+- (Optional) `KUBE_API_SERVER`, `KUBE_CA_FILE`
 
-Limit kubectl to a safe allowlist of subcommands/flags.
+## 12. Failure modes & handling
 
-Log request IDs + user OID (not raw tokens) for audit.
+- `MsalUiRequiredException` / silent returns `None` → trigger incremental consent flow for `AKS_APP/.default` (one-time).
+- `401/403` from API server → check `aud=AKS`, user vs. app token (`idtyp` must not be "app"), RBAC bindings.
+- “cert signed by unknown authority” → supply cluster CA or use kubeconfig with CA embedded.
+- Empty `get_accounts()` → you’re not restoring the same MSAL cache; fix cache persistence.
 
-### 10. Rate limiting (optional MVP)
+## 13. Minimal sequence diagram (text)
 
-Per-user sliding window (e.g., 60 req / min). Key on home_account_id. Store counters in Redis or in-proc if single-instance.
-
-### 11. Config (env)
-
-TENANT_ID, CLIENT_ID, REDIRECT_URI
-
-AZURE_FEDERATED_TOKEN_FILE
-
-SESSION_SECRET
-
-(Optional) KUBE_API_SERVER, KUBE_CA_FILE
-
-### 12. Failure modes & handling
-
-MsalUiRequiredException / silent returns None → trigger incremental consent flow for AKS_APP/.default (one-time). 
-GitHub
-
-401/403 from API server → check aud=AKS, user vs app token (idtyp must not be "app"), RBAC bindings.
-
-“cert signed by unknown authority” → supply cluster CA or use kubeconfig with CA embedded.
-
-Empty get_accounts() → you’re not restoring the same MSAL cache; fix cache persistence.
-
-### 13. Minimal sequence diagram (text)
-
+```text
 Browser -> Proxy (/login): start OIDC
 Proxy -> Entra: authorize (openid profile offline_access)
 Entra -> Browser -> Proxy (/callback?code=...): auth code
@@ -159,15 +134,11 @@ Proxy -> Entra (MSAL silent): AKS /.default (user-scoped)
 Entra -> Proxy: AKS user token
 Proxy -> Kube API: Bearer <AKS token> (+ CA)
 Kube API -> Proxy: authorized as that user (RBAC)
+```
 
+## 14. Implementation sketch (one-liners)
 
-### 14. Implementation sketch (one-liners)
-
-/login → get_authorization_request_url(scopes=OIDC_SCOPES)
-
-/callback → acquire_token_by_authorization_code(OIDC_SCOPES) → save cache + home_account_id
-
-Get AKS token → acquire_token_silent([AKS_APP/.default], account=by_home_account_id)
-(redirect once with prompt=consent if needed)
-
-Call API/kubectl → inject Authorization: Bearer <AKS_USER_TOKEN> and correct CA.
+- `/login` → `get_authorization_request_url(scopes=OIDC_SCOPES)`
+- `/callback` → `acquire_token_by_authorization_code(OIDC_SCOPES)` → save cache + `home_account_id`
+- Get AKS token → `acquire_token_silent([AKS_APP/.default], account=by_home_account_id)` (redirect once with `prompt=consent` if needed)
+- Call API/`kubectl` → inject `Authorization: Bearer <AKS_USER_TOKEN>` and the correct CA.
