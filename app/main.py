@@ -1,0 +1,253 @@
+"""FastAPI application exposing the OAuth proxy endpoints."""
+
+from __future__ import annotations
+
+import logging
+import secrets
+import time
+from typing import Any, Dict
+
+import msal
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
+
+from .config import get_settings
+from .msal_client import (
+    build_cache_from_session,
+    build_confidential_client,
+    get_account_for_session,
+    persist_cache_to_session,
+)
+from .pkce import create_pkce_pair
+from .session import SessionManager
+from .token_service import acquire_aks_token, needs_refresh
+from .utils import decode_jwt_without_verification
+
+logger = logging.getLogger(__name__)
+
+
+settings = get_settings()
+session_manager = SessionManager(
+    cookie_name=settings.session_cookie_name,
+    idle_timeout_seconds=settings.session_idle_timeout_seconds,
+    absolute_timeout_seconds=settings.session_absolute_timeout_seconds,
+    cookie_secure=settings.cookie_secure,
+    cookie_samesite=settings.cookie_samesite,
+)
+
+AUTH_FLOW_KEY = "auth_flow"
+AKS_TOKEN_KEY = "aks_token"
+
+
+app = FastAPI(title="AKS OAuth Proxy", version="1.0.0")
+
+
+def _new_state() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _store_user(session: Dict[str, Any], client: msal.ConfidentialClientApplication, result: Dict[str, Any]) -> Dict[str, Any]:
+    accounts = client.get_accounts()
+    if not accounts:
+        raise HTTPException(status_code=500, detail="No account information returned from MSAL")
+
+    account = accounts[0]
+    claims = result.get("id_token_claims") or {}
+    session["user"] = {
+        "home_account_id": account.get("home_account_id"),
+        "username": account.get("username"),
+        "oid": claims.get("oid"),
+        "tid": claims.get("tid"),
+        "upn": claims.get("preferred_username"),
+        "name": claims.get("name"),
+        "id_token_claims": claims,
+        "updated_at": int(time.time()),
+    }
+    return account
+
+
+def _start_incremental_consent(
+    handle,
+    session: Dict[str, Any],
+    client: msal.ConfidentialClientApplication,
+    account: Dict[str, Any],
+):
+    verifier, challenge = create_pkce_pair()
+    state = _new_state()
+    session[AUTH_FLOW_KEY] = {
+        "state": state,
+        "scopes": [settings.aks_scope],
+        "type": "consent",
+        "code_verifier": verifier,
+        "created_at": int(time.time()),
+    }
+
+    login_hint = account.get("username")
+    auth_url = client.get_authorization_request_url(
+        scopes=[settings.aks_scope],
+        redirect_uri=settings.redirect_uri,
+        state=state,
+        prompt="consent",
+        login_hint=login_hint,
+        code_challenge=challenge,
+        code_challenge_method="S256",
+    )
+    response = RedirectResponse(auth_url, status_code=302)
+    handle.commit(response)
+    return response
+
+
+@app.get("/")
+async def root() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/login")
+async def login(request: Request):
+    handle = session_manager.load_session(request)
+    verifier, challenge = create_pkce_pair()
+    state = _new_state()
+    client = build_confidential_client()
+
+    auth_url = client.get_authorization_request_url(
+        scopes=settings.oidc_scopes,
+        redirect_uri=settings.redirect_uri,
+        state=state,
+        prompt="select_account",
+        code_challenge=challenge,
+        code_challenge_method="S256",
+    )
+
+    response = RedirectResponse(auth_url, status_code=302)
+    session = handle.rotate(response)
+    session.clear()
+    session[AUTH_FLOW_KEY] = {
+        "state": state,
+        "scopes": settings.oidc_scopes,
+        "type": "login",
+        "code_verifier": verifier,
+        "created_at": int(time.time()),
+    }
+    handle.commit(response)
+    return response
+
+
+@app.get("/callback")
+async def callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None, error_description: str | None = None):
+    handle = session_manager.load_session(request)
+    session = handle.data
+
+    if error:
+        raise HTTPException(status_code=400, detail=f"Authorization error: {error}: {error_description}")
+
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing authorization code or state")
+
+    flow = session.get(AUTH_FLOW_KEY)
+    if not flow or flow.get("state") != state:
+        raise HTTPException(status_code=400, detail="Invalid or expired state")
+
+    verifier = flow.get("code_verifier")
+    if not verifier:
+        raise HTTPException(status_code=400, detail="Missing PKCE verifier in session")
+
+    scopes = flow.get("scopes") or settings.oidc_scopes
+
+    cache = build_cache_from_session(session)
+    client = build_confidential_client(cache)
+
+    token_result = client.acquire_token_by_authorization_code(
+        code,
+        scopes=scopes,
+        redirect_uri=settings.redirect_uri,
+        code_verifier=verifier,
+    )
+
+    if "error" in token_result:
+        description = token_result.get("error_description") or token_result["error"]
+        raise HTTPException(status_code=400, detail=f"Token acquisition failed: {description}")
+
+    persist_cache_to_session(cache, session)
+
+    if flow.get("type") == "login":
+        account = _store_user(session, client, token_result)
+    else:
+        account = get_account_for_session(client, session)
+        if not account:
+            raise HTTPException(status_code=400, detail="User session not initialised")
+
+    session.pop(AUTH_FLOW_KEY, None)
+
+    token_entry, interaction_error = acquire_aks_token(client, account)
+    if token_entry:
+        session[AKS_TOKEN_KEY] = token_entry
+        persist_cache_to_session(cache, session)
+        response = RedirectResponse(url="/whoami", status_code=302)
+        handle.commit(response)
+        return response
+
+    session.pop(AKS_TOKEN_KEY, None)
+    if interaction_error in {"interaction_required", "consent_required"}:
+        response = _start_incremental_consent(handle, session, client, account)
+        persist_cache_to_session(cache, session)
+        return response
+
+    logger.error("Unable to acquire AKS token: %s", interaction_error)
+    raise HTTPException(status_code=500, detail="Failed to acquire AKS token")
+
+
+@app.get("/whoami")
+async def whoami(request: Request):
+    handle = session_manager.load_session(request)
+    session = handle.data
+
+    user = session.get("user")
+    if not user:
+        raise HTTPException(status_code=401, detail="User is not signed in")
+
+    token_entry = session.get(AKS_TOKEN_KEY)
+    if needs_refresh(token_entry):
+        cache = build_cache_from_session(session)
+        client = build_confidential_client(cache)
+        account = get_account_for_session(client, session)
+        if not account:
+            raise HTTPException(status_code=401, detail="User session not initialised")
+        token_entry, interaction_error = acquire_aks_token(client, account)
+        if not token_entry:
+            session.pop(AKS_TOKEN_KEY, None)
+            if interaction_error in {"interaction_required", "consent_required"}:
+                raise HTTPException(status_code=401, detail="Additional consent required")
+            raise HTTPException(status_code=500, detail="Failed to acquire AKS token")
+        session[AKS_TOKEN_KEY] = token_entry
+        persist_cache_to_session(cache, session)
+
+    aks_token = session.get(AKS_TOKEN_KEY)
+    try:
+        claims = decode_jwt_without_verification(aks_token["access_token"])
+    except Exception as exc:  # pragma: no cover - indicates malformed token
+        raise HTTPException(status_code=500, detail="Stored AKS token is invalid") from exc
+
+    response_payload = {
+        "user": {
+            "home_account_id": user.get("home_account_id"),
+            "username": user.get("username"),
+            "oid": user.get("oid"),
+            "upn": user.get("upn"),
+        },
+        "aks_token": {
+            "expires_on": aks_token.get("expires_on"),
+            "scope": aks_token.get("scope"),
+            "claims": {
+                "aud": claims.get("aud"),
+                "iss": claims.get("iss"),
+                "oid": claims.get("oid"),
+                "upn": claims.get("upn"),
+                "idtyp": claims.get("idtyp"),
+            },
+        },
+    }
+
+    response = JSONResponse(response_payload)
+    handle.commit(response)
+    return response
+
