@@ -1,0 +1,99 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/your-org/oauth-proxy
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  labels: {}
+  azureWorkloadIdentity:
+    enabled: true
+    clientId: ""  # Application (client) ID for the workload identity
+    tenantId: ""  # Microsoft Entra tenant ID for workload identity tokens
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources: {}
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+settings:
+  tenantId: ""  # Microsoft Entra tenant ID used for user sign-in
+  clientId: ""  # Application (client) ID used by the proxy
+  redirectUri: ""  # Redirect URI configured in the app registration
+  federatedTokenFile: /var/run/secrets/azure/tokens/azure-identity-token
+  sessionCookieName: proxy_session
+  sessionCookieSecure: true
+  sessionCookieSameSite: lax
+  sessionIdleTimeoutSeconds: 1800
+  sessionAbsoluteTimeoutSeconds: 28800
+  extraEnv: []
+
+sessionSecret:
+  existingSecret: ""  # Set to use a pre-created secret instead of creating one
+  key: session-secret  # Key within the secret that stores SESSION_SECRET
+  value: ""  # Plaintext session secret when not using an existing secret
+
+livenessProbe:
+  enabled: true
+  path: /
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  enabled: true
+  path: /
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+containerPort: 8080
