@@ -8,6 +8,21 @@ The OAuth proxy is a FastAPI service that signs users in with Microsoft Entra us
 * `/callback` finalises the authorization code exchange, persists the MSAL cache in the server-side session and acquires the AKS user token (prompting for incremental consent when required).
 * `/whoami` returns the cached AKS token metadata and decoded claims for the signed-in user, automatically refreshing the token when it is close to expiry. 【F:app/main.py†L105-L251】
 
+## Code flow
+### 1. Initial `/login` request
+- FastAPI routes the call to the `login` handler, which loads or creates a session bound to the signed cookie and purges expired entries so the request starts with a valid container.
+- A PKCE verifier/challenge pair and cryptographically random `state` value are generated. The verifier stays server-side while the challenge and state are sent to Microsoft Entra to protect the later callback from interception or CSRF.
+- A fresh MSAL confidential client is instantiated using the workload-identity client assertion from the federated token file so the proxy itself never stores long-lived secrets.
+- MSAL composes the authorization request URL with the configured scopes, redirect URI, random state, “select account” prompt and PKCE challenge, defining what information is requested and binding the callback to this session.
+- Before returning the `302` redirect, the session rotates its identifier, clears previous data and persists an `auth_flow` record (state, scopes, flow type, PKCE verifier, timestamp). The new cookie is written on the response so the callback can validate the returning code against these artifacts.
+- The handler logs the redirect and commits the session, sending the browser to Microsoft Entra carrying the state and PKCE challenge that will anchor the forthcoming callback.
+
+### 2. After Microsoft Entra redirects back
+- The `/callback` handler reloads the session, checks for OAuth error parameters and validates both the `state` and stored PKCE verifier to ensure the response matches the initiation request before redeeming the authorization code.
+- The MSAL token cache is rebuilt from the session, the confidential client is re-created and the authorization code is exchanged using the stored PKCE verifier and redirect URI. Any MSAL error results in a 400 response so callers know to restart the flow.
+- On a first-time login, ID-token claims and account metadata are cached in the session for later silent token acquisition, and the serialised MSAL cache is persisted for subsequent requests.
+- Immediately after redeeming the code, the proxy silently requests an AKS user-scoped token using the stored account. A successful response is written to the session (and the cache saved) before redirecting the user to `/whoami`; if MSAL indicates additional consent is needed, the proxy triggers an incremental-consent redirect using the same PKCE and state protections.
+
 ## Project structure
 ```
 .
