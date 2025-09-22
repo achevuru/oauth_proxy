@@ -76,17 +76,27 @@ class SessionManager:
         session_id = request.cookies.get(self._cookie_name)
         now = time.time()
         with self._lock:
+            # Clean up any expired sessions to keep the in-memory store
+            # bounded. This is a lightweight operation because the number of
+            # sessions is typically small.
             self._purge_expired(now)
             entry = None
             if session_id:
                 entry = self._sessions.get(session_id)
                 if entry and self._is_expired(entry, now):
+                    # If the cookie references an expired session we discard
+                    # it to force creation of a fresh session entry.
                     del self._sessions[session_id]
                     entry = None
 
             if entry is None:
+                # Either no session cookie was presented, or the referenced
+                # session expired. Create a new entry and return it to the
+                # caller.
                 session_id, entry = self._create_session_locked()
             else:
+                # For existing sessions we simply mark the last access time
+                # so idle expiry works correctly.
                 entry.last_access = now
 
         return SessionHandle(self, session_id, entry)
@@ -100,10 +110,13 @@ class SessionManager:
     def _rotate_session(self, old_session_id: str) -> tuple[str, SessionEntry]:
         with self._lock:
             if old_session_id in self._sessions:
+                # Drop the old session entirely; rotation is used when the
+                # user signs in to prevent session fixation.
                 del self._sessions[old_session_id]
             return self._create_session_locked()
 
     def _purge_expired(self, now: float) -> None:
+        # Collect keys first so we can safely delete while iterating.
         expired = [
             session_id
             for session_id, entry in self._sessions.items()
@@ -113,6 +126,9 @@ class SessionManager:
             del self._sessions[session_id]
 
     def _is_expired(self, entry: SessionEntry, now: float) -> bool:
+        # The idle timeout ensures sessions disappear after inactivity,
+        # whereas the absolute timeout bounds the maximum lifetime even for
+        # busy sessions.
         if self._idle_timeout and now - entry.last_access > self._idle_timeout:
             return True
         if self._absolute_timeout and now - entry.created_at > self._absolute_timeout:

@@ -43,10 +43,19 @@ app = FastAPI(title="AKS OAuth Proxy", version="1.0.0")
 
 
 def _new_state() -> str:
+    """Return a cryptographically random state parameter."""
+
+    # ``secrets.token_urlsafe`` already returns a suitably random string
+    # so we simply pass through its output. The helper provides a single
+    # place to adjust the state generation strategy should we need to.
     return secrets.token_urlsafe(32)
 
 
 def _store_user(session: Dict[str, Any], client: msal.ConfidentialClientApplication, result: Dict[str, Any]) -> Dict[str, Any]:
+    # The MSAL client caches any accounts discovered during the
+    # authorization-code exchange. We expect exactly one account for the
+    # signed-in user; if MSAL returns nothing, something has gone wrong in
+    # the upstream login process.
     accounts = client.get_accounts()
     if not accounts:
         raise HTTPException(status_code=500, detail="No account information returned from MSAL")
@@ -72,6 +81,10 @@ def _start_incremental_consent(
     client: msal.ConfidentialClientApplication,
     account: Dict[str, Any],
 ):
+    # When the AKS token request fails because additional permissions are
+    # required we kick off a fresh authorization flow. PKCE is required for
+    # the public-client style redirect, so we generate a new verifier and
+    # code challenge pair and persist the verifier in the session.
     verifier, challenge = create_pkce_pair()
     state = _new_state()
     session[AUTH_FLOW_KEY] = {
@@ -92,6 +105,9 @@ def _start_incremental_consent(
         code_challenge=challenge,
         code_challenge_method="S256",
     )
+    # The PKCE verifier is stored in the session, while the challenge and
+    # state travel with the redirect. Once the user completes the consent
+    # prompt the callback handler will verify that they match.
     response = RedirectResponse(auth_url, status_code=302)
     handle.commit(response)
     return response
@@ -104,9 +120,17 @@ async def root() -> Dict[str, str]:
 
 @app.get("/login")
 async def login(request: Request):
+    # Sessions are keyed on a signed cookie. ``load_session`` returns a
+    # handle that lets us transparently update the underlying entry while
+    # ensuring cookies are written back to the client.
     handle = session_manager.load_session(request)
+    # PKCE protects the authorization-code flow for public clients. The
+    # verifier must stay server-side whereas the challenge is sent to the
+    # identity provider.
     verifier, challenge = create_pkce_pair()
     state = _new_state()
+    # A new confidential client application is created for every request
+    # so each handler operates with a fresh view of the MSAL cache.
     client = build_confidential_client()
 
     auth_url = client.get_authorization_request_url(
@@ -119,6 +143,8 @@ async def login(request: Request):
     )
 
     response = RedirectResponse(auth_url, status_code=302)
+    # ``rotate`` assigns a brand new session identifier to avoid session
+    # fixation and clears any leftover data from previous logins.
     session = handle.rotate(response)
     session.clear()
     session[AUTH_FLOW_KEY] = {
@@ -153,9 +179,14 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
     scopes = flow.get("scopes") or settings.oidc_scopes
 
+    # Rehydrate the MSAL token cache from the session data before creating
+    # the client so that MSAL can correlate the authorization response with
+    # previous requests.
     cache = build_cache_from_session(session)
     client = build_confidential_client(cache)
 
+    # Exchange the authorization code for tokens while validating the PKCE
+    # verifier that was stored in the session during the initial redirect.
     token_result = client.acquire_token_by_authorization_code(
         code,
         scopes=scopes,
@@ -170,14 +201,21 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     persist_cache_to_session(cache, session)
 
     if flow.get("type") == "login":
+        # For initial sign-ins MSAL has just stored the account metadata in
+        # its cache. We extract that information and persist it alongside the
+        # session so future requests can locate the correct account.
         account = _store_user(session, client, token_result)
     else:
+        # Incremental consent flows do not replace the logged-in user, so we
+        # look up the previously cached account for the current session.
         account = get_account_for_session(client, session)
         if not account:
             raise HTTPException(status_code=400, detail="User session not initialised")
 
     session.pop(AUTH_FLOW_KEY, None)
 
+    # Try to obtain the downstream AKS token immediately so the user lands
+    # on the "whoami" endpoint with a valid token in hand.
     token_entry, interaction_error = acquire_aks_token(client, account)
     if token_entry:
         session[AKS_TOKEN_KEY] = token_entry
@@ -207,6 +245,8 @@ async def whoami(request: Request):
 
     token_entry = session.get(AKS_TOKEN_KEY)
     if needs_refresh(token_entry):
+        # Refreshing requires the MSAL cache; we rebuild the client with the
+        # cached state and then silently request a new token.
         cache = build_cache_from_session(session)
         client = build_confidential_client(cache)
         account = get_account_for_session(client, session)
@@ -223,6 +263,9 @@ async def whoami(request: Request):
 
     aks_token = session.get(AKS_TOKEN_KEY)
     try:
+        # Only the downstream services validate the token signature. For the
+        # informational "whoami" response we decode the JWT locally without
+        # verification to surface useful claims to the caller.
         claims = decode_jwt_without_verification(aks_token["access_token"])
     except Exception as exc:  # pragma: no cover - indicates malformed token
         raise HTTPException(status_code=500, detail="Stored AKS token is invalid") from exc
