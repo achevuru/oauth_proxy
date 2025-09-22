@@ -59,6 +59,18 @@ The root endpoint responds with a simple health payload, while `/login` kicks of
 ### Testing
 Automated test suites have not been implemented yet. Until they are added, validate changes manually by exercising the login flow and verifying the `/whoami` response against the target AKS cluster.
 
+The `/login` endpoint is the entry point that initiates the Microsoft Entra OAuth flow. With the server running locally on port `8080`, you can use `curl` to observe the initial redirect and confirm that the session cookie is issued:
+
+```bash
+curl -i -c cookies.txt http://localhost:8080/login
+```
+
+The response should return `302 Found` with a `Location` header pointing at the Microsoft sign-in page and a `Set-Cookie` header for the proxy session. Complete the sign-in in a browser (or another HTTP client capable of following the redirect and handling the interactive login). After the identity provider redirects back to `/callback`, the proxy will finish exchanging the authorization code. You can then inspect the cached AKS token details with:
+
+```bash
+curl -b cookies.txt http://localhost:8080/whoami
+```
+
 ## Container image
 A production-friendly container image can be built from the provided Dockerfile:
 ```bash
