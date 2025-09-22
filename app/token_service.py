@@ -20,6 +20,12 @@ class TokenAcquisitionError(Exception):
 
 
 def needs_refresh(token_entry: Optional[Dict[str, Any]]) -> bool:
+    """Return ``True`` when the cached token should be refreshed."""
+
+    # The FastAPI endpoints frequently access the cached token. Rather than
+    # fail with an expired token we renew it slightly ahead of the expiry
+    # time. Any parsing errors are treated as an expired token to avoid
+    # propagating corrupt state.
     if not token_entry:
         return True
     try:
@@ -30,6 +36,11 @@ def needs_refresh(token_entry: Optional[Dict[str, Any]]) -> bool:
 
 
 def build_token_entry(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise MSAL responses into the structure stored in the session."""
+
+    # The extra metadata makes it easier to debug token lifetimes from the
+    # session contents and ensures we only depend on the fields we care
+    # about downstream.
     return {
         "access_token": result["access_token"],
         "expires_on": int(result["expires_on"]),
@@ -52,6 +63,8 @@ def acquire_aks_token(
     settings = get_settings()
     result = app.acquire_token_silent([settings.aks_scope], account=account)
     if not result:
+        # ``None`` indicates MSAL could not find a usable cached token and
+        # interactive consent is required.
         return None, "interaction_required"
 
     error = result.get("error")
@@ -60,6 +73,9 @@ def acquire_aks_token(
         return None, error
 
     if "access_token" not in result:
+        # A missing token is unexpected but can happen with misconfigured
+        # scopes. Surface a descriptive error to the caller so they can
+        # trigger a fresh consent flow.
         logger.warning("Silent token acquisition returned no access token")
         return None, "unknown_error"
 
