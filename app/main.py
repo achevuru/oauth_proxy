@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import secrets
 import time
-from typing import Any, Dict
+from pprint import pformat
+from typing import Any, Dict, Optional
 
 import msal
 from fastapi import FastAPI, HTTPException, Request
@@ -40,6 +41,26 @@ AKS_TOKEN_KEY = "aks_token"
 
 
 app = FastAPI(title="AKS OAuth Proxy", version="1.0.0")
+
+
+def _log_flow_step(step: str, details: Optional[Dict[str, Any]] = None) -> None:
+    """Emit structured log entries for the OAuth flow steps."""
+
+    if details:
+        pretty_details = pformat(details, sort_dicts=True)
+        logger.info("[OAuth flow] %s\n%s", step, pretty_details)
+    else:
+        logger.info("[OAuth flow] %s", step)
+
+
+def _decode_token_for_logging(access_token: str) -> Dict[str, Any]:
+    """Decode a JWT for logging without raising on failure."""
+
+    try:
+        return decode_jwt_without_verification(access_token)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.warning("Failed to decode access token for logging: %s", exc)
+        return {"error": str(exc)}
 
 
 def _new_state() -> str:
@@ -109,6 +130,18 @@ def _start_incremental_consent(
     # state travel with the redirect. Once the user completes the consent
     # prompt the callback handler will verify that they match.
     response = RedirectResponse(auth_url, status_code=302)
+    _log_flow_step(
+        "Starting incremental consent flow",
+        {
+            "authorization_url": auth_url,
+            "scopes": [settings.aks_scope],
+            "state": state,
+            "user": {
+                "home_account_id": account.get("home_account_id"),
+                "username": account.get("username"),
+            },
+        },
+    )
     handle.commit(response)
     return response
 
@@ -154,6 +187,17 @@ async def login(request: Request):
         "code_verifier": verifier,
         "created_at": int(time.time()),
     }
+    _log_flow_step(
+        "Initiating login redirect",
+        {
+            "authorization_url": auth_url,
+            "pkce": {
+                "code_challenge": challenge,
+            },
+            "scopes": settings.oidc_scopes,
+            "state": state,
+        },
+    )
     handle.commit(response)
     return response
 
@@ -179,6 +223,16 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
     scopes = flow.get("scopes") or settings.oidc_scopes
 
+    _log_flow_step(
+        "Processing authorization callback",
+        {
+            "authorization_code": code,
+            "flow_type": flow.get("type"),
+            "scopes": scopes,
+            "state": state,
+        },
+    )
+
     # Rehydrate the MSAL token cache from the session data before creating
     # the client so that MSAL can correlate the authorization response with
     # previous requests.
@@ -198,6 +252,17 @@ async def callback(request: Request, code: str | None = None, state: str | None 
         description = token_result.get("error_description") or token_result["error"]
         raise HTTPException(status_code=400, detail=f"Token acquisition failed: {description}")
 
+    _log_flow_step(
+        "Authorization code exchanged for tokens",
+        {
+            "authorization_code": code,
+            "expires_on": token_result.get("expires_on"),
+            "flow_type": flow.get("type"),
+            "scope": token_result.get("scope"),
+            "state": state,
+        },
+    )
+
     persist_cache_to_session(cache, session)
 
     if flow.get("type") == "login":
@@ -205,6 +270,15 @@ async def callback(request: Request, code: str | None = None, state: str | None 
         # its cache. We extract that information and persist it alongside the
         # session so future requests can locate the correct account.
         account = _store_user(session, client, token_result)
+        _log_flow_step(
+            "User information cached in session",
+            {
+                "user": {
+                    "home_account_id": session["user"].get("home_account_id"),
+                    "username": session["user"].get("username"),
+                }
+            },
+        )
     else:
         # Incremental consent flows do not replace the logged-in user, so we
         # look up the previously cached account for the current session.
@@ -220,12 +294,24 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     if token_entry:
         session[AKS_TOKEN_KEY] = token_entry
         persist_cache_to_session(cache, session)
+        _log_flow_step(
+            "AKS access token acquired",
+            {
+                "expires_on": token_entry.get("expires_on"),
+                "scope": token_entry.get("scope"),
+                "token_claims": _decode_token_for_logging(token_entry["access_token"]),
+            },
+        )
         response = RedirectResponse(url="/whoami", status_code=302)
         handle.commit(response)
         return response
 
     session.pop(AKS_TOKEN_KEY, None)
     if interaction_error in {"interaction_required", "consent_required"}:
+        _log_flow_step(
+            "AKS token requires additional consent",
+            {"interaction_error": interaction_error},
+        )
         response = _start_incremental_consent(handle, session, client, account)
         persist_cache_to_session(cache, session)
         return response
@@ -260,6 +346,14 @@ async def whoami(request: Request):
             raise HTTPException(status_code=500, detail="Failed to acquire AKS token")
         session[AKS_TOKEN_KEY] = token_entry
         persist_cache_to_session(cache, session)
+        _log_flow_step(
+            "AKS access token refreshed",
+            {
+                "expires_on": token_entry.get("expires_on"),
+                "scope": token_entry.get("scope"),
+                "token_claims": _decode_token_for_logging(token_entry["access_token"]),
+            },
+        )
 
     aks_token = session.get(AKS_TOKEN_KEY)
     try:
@@ -269,6 +363,15 @@ async def whoami(request: Request):
         claims = decode_jwt_without_verification(aks_token["access_token"])
     except Exception as exc:  # pragma: no cover - indicates malformed token
         raise HTTPException(status_code=500, detail="Stored AKS token is invalid") from exc
+
+    _log_flow_step(
+        "Returning AKS access token information",
+        {
+            "expires_on": aks_token.get("expires_on"),
+            "scope": aks_token.get("scope"),
+            "token_claims": claims,
+        },
+    )
 
     response_payload = {
         "user": {
