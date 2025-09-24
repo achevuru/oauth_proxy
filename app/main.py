@@ -108,9 +108,10 @@ def _start_incremental_consent(
     # code challenge pair and persist the verifier in the session.
     verifier, challenge = create_pkce_pair()
     state = _new_state()
+    incremental_scopes = [settings.aks_delegated_scope]
     session[AUTH_FLOW_KEY] = {
         "state": state,
-        "scopes": [settings.aks_scope],
+        "scopes": incremental_scopes,
         "type": "consent",
         "code_verifier": verifier,
         "created_at": int(time.time()),
@@ -118,7 +119,7 @@ def _start_incremental_consent(
 
     login_hint = account.get("username")
     auth_url = client.get_authorization_request_url(
-        scopes=[settings.aks_scope],
+        scopes=incremental_scopes,
         redirect_uri=settings.redirect_uri,
         state=state,
         prompt="consent",
@@ -134,7 +135,7 @@ def _start_incremental_consent(
         "Starting incremental consent flow",
         {
             "authorization_url": auth_url,
-            "scopes": [settings.aks_scope],
+            "scopes": incremental_scopes,
             "state": state,
             "user": {
                 "home_account_id": account.get("home_account_id"),

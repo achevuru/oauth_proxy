@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 
 
+AKS_RESOURCE_APP_ID = "6dae42f8-4368-4678-94ff-3960e28e3630"
+DEFAULT_AKS_SCOPE = f"{AKS_RESOURCE_APP_ID}/.default"
+DEFAULT_AKS_DELEGATED_SCOPE = f"{AKS_RESOURCE_APP_ID}/user_impersonation"
+
+
 @dataclass
 class Settings:
     """Runtime settings loaded from the environment."""
@@ -24,7 +29,8 @@ class Settings:
     oidc_scopes: list[str] = field(
         default_factory=lambda: ["openid", "profile", "offline_access"]
     )
-    aks_scope: str = "6dae42f8-4368-4678-94ff-3960e28e3630/.default"
+    aks_scope: str = DEFAULT_AKS_SCOPE
+    aks_delegated_scope: str = DEFAULT_AKS_DELEGATED_SCOPE
 
     @property
     def authority(self) -> str:
@@ -94,5 +100,9 @@ def get_settings() -> Settings:
         session_cookie_name=os.getenv("SESSION_COOKIE_NAME", "proxy_session"),
         cookie_secure=cookie_secure,
         cookie_samesite=cookie_samesite,
+        aks_scope=os.getenv("AKS_SCOPE", DEFAULT_AKS_SCOPE),
+        aks_delegated_scope=os.getenv(
+            "AKS_DELEGATED_SCOPE", DEFAULT_AKS_DELEGATED_SCOPE
+        ),
     )
 
