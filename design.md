@@ -76,7 +76,7 @@ Store:
 
 Preferred: pre-grant AKS delegated permission to your client app (App Registration → API permissions → Azure Kubernetes Service AAD Server → Delegated → `user_impersonation` → Grant admin consent). Then `/.default` is silent.
 
-Otherwise: handle incremental consent once—if silent fails, redirect with `scopes=[AKS_APP/.default]` + `prompt=consent`. After callback, future silent works. (This mirrors Microsoft’s guidance on incremental consent & “UI required” paths.)
+Otherwise: handle incremental consent once—if silent fails, redirect with `scopes=[AKS_APP/user_impersonation]` + `prompt=consent`. After callback, future silent works. (This mirrors Microsoft’s guidance on incremental consent & “UI required” paths.)
 
 ## 7. Workload Identity (confidential client with `client_assertion`)
 
@@ -116,7 +116,7 @@ Per-user sliding window (e.g., 60 requests/min). Key on `home_account_id`. Store
 
 ## 12. Failure modes & handling
 
-- `MsalUiRequiredException` / silent returns `None` → trigger incremental consent flow for `AKS_APP/.default` (one-time).
+- `MsalUiRequiredException` / silent returns `None` → trigger incremental consent flow for `AKS_APP/user_impersonation` (one-time).
 - `401/403` from API server → check `aud=AKS`, user vs. app token (`idtyp` must not be "app"), RBAC bindings.
 - “cert signed by unknown authority” → supply cluster CA or use kubeconfig with CA embedded.
 - Empty `get_accounts()` → you’re not restoring the same MSAL cache; fix cache persistence.
