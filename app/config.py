@@ -10,6 +10,7 @@ from functools import lru_cache
 AKS_RESOURCE_APP_ID = "6dae42f8-4368-4678-94ff-3960e28e3630"
 DEFAULT_AKS_SCOPE = f"{AKS_RESOURCE_APP_ID}/.default"
 DEFAULT_AKS_DELEGATED_SCOPE = f"{AKS_RESOURCE_APP_ID}/user_impersonation"
+DEFAULT_KUBELOGIN_CLIENT_ID = "80faf920-1908-4b52-b5ef-a8e7bedfc67a"
 
 
 @dataclass
@@ -31,12 +32,26 @@ class Settings:
     )
     aks_scope: str = DEFAULT_AKS_SCOPE
     aks_delegated_scope: str = DEFAULT_AKS_DELEGATED_SCOPE
+    kubelogin_binary: str = "kubelogin"
+    kubelogin_login: str = "devicecode"
+    kubelogin_client_id: str = DEFAULT_KUBELOGIN_CLIENT_ID
+    kubelogin_environment: str = "AzurePublicCloud"
+    kubelogin_enabled: bool = True
 
     @property
     def authority(self) -> str:
         """Microsoft Entra authority URL for the configured tenant."""
 
         return f"https://login.microsoftonline.com/{self.tenant_id}"
+
+    @property
+    def aks_server_app_id(self) -> str:
+        """Return the resource application ID for AKS from the configured scope."""
+
+        scope = self.aks_scope
+        if not scope:
+            return AKS_RESOURCE_APP_ID
+        return scope.split("/")[0]
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
@@ -88,6 +103,15 @@ def get_settings() -> Settings:
 
     cookie_secure = _parse_bool(os.getenv("SESSION_COOKIE_SECURE"), True)
     cookie_samesite = _optional_env("SESSION_COOKIE_SAMESITE") or "lax"
+    kubelogin_binary = os.getenv("KUBELOGIN_BINARY", "kubelogin")
+    kubelogin_login = os.getenv("KUBELOGIN_LOGIN", "devicecode")
+    kubelogin_client_id = os.getenv(
+        "KUBELOGIN_CLIENT_ID", DEFAULT_KUBELOGIN_CLIENT_ID
+    )
+    kubelogin_environment = os.getenv(
+        "KUBELOGIN_ENVIRONMENT", "AzurePublicCloud"
+    )
+    kubelogin_enabled = _parse_bool(os.getenv("KUBELOGIN_ENABLED"), True)
 
     return Settings(
         tenant_id=tenant_id,
@@ -104,5 +128,10 @@ def get_settings() -> Settings:
         aks_delegated_scope=os.getenv(
             "AKS_DELEGATED_SCOPE", DEFAULT_AKS_DELEGATED_SCOPE
         ),
+        kubelogin_binary=kubelogin_binary,
+        kubelogin_login=kubelogin_login,
+        kubelogin_client_id=kubelogin_client_id,
+        kubelogin_environment=kubelogin_environment,
+        kubelogin_enabled=kubelogin_enabled,
     )
 

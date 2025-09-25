@@ -13,6 +13,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from .config import get_settings
+from .kubelogin_runner import (
+    KubeloginError,
+    build_token_entry as build_kubelogin_token_entry,
+    get_job as get_kubelogin_job,
+    remove_job as remove_kubelogin_job,
+    start_job as start_kubelogin_job,
+)
 from .msal_client import (
     build_cache_from_session,
     build_confidential_client,
@@ -38,6 +45,7 @@ session_manager = SessionManager(
 
 AUTH_FLOW_KEY = "auth_flow"
 AKS_TOKEN_KEY = "aks_token"
+KUBELOGIN_JOB_KEY = "kubelogin_job"
 
 
 app = FastAPI(title="AKS OAuth Proxy", version="1.0.0")
@@ -309,6 +317,33 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
     session.pop(AKS_TOKEN_KEY, None)
     if interaction_error in {"interaction_required", "consent_required"}:
+        login_hint = account.get("username")
+        if settings.kubelogin_enabled:
+            try:
+                job = start_kubelogin_job(login_hint)
+            except KubeloginError as exc:
+                logger.warning("kubelogin fallback failed to start: %s", exc)
+            else:
+                message = job.wait_for_message(timeout=5.0)
+                session[KUBELOGIN_JOB_KEY] = {
+                    "id": job.id,
+                    "created_at": int(time.time()),
+                    "message": message,
+                }
+                persist_cache_to_session(cache, session)
+                _log_flow_step(
+                    "Delegating AKS token acquisition to kubelogin",
+                    {
+                        "kubelogin_job_id": job.id,
+                        "login_hint": login_hint,
+                    },
+                )
+                response = RedirectResponse(
+                    url="/kubelogin/device-code", status_code=302
+                )
+                handle.commit(response)
+                return response
+
         _log_flow_step(
             "AKS token requires additional consent",
             {"interaction_error": interaction_error},
@@ -319,6 +354,75 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
     logger.error("Unable to acquire AKS token: %s", interaction_error)
     raise HTTPException(status_code=500, detail="Failed to acquire AKS token")
+
+
+@app.get("/kubelogin/device-code")
+async def kubelogin_device_code(request: Request):
+    handle = session_manager.load_session(request)
+    session = handle.data
+
+    job_info = session.get(KUBELOGIN_JOB_KEY)
+    if not job_info:
+        raise HTTPException(status_code=404, detail="No kubelogin flow is active")
+
+    job_id = job_info.get("id")
+    if not job_id:
+        session.pop(KUBELOGIN_JOB_KEY, None)
+        response = JSONResponse(
+            {"status": "error", "message": "kubelogin session is misconfigured"},
+            status_code=500,
+        )
+        handle.commit(response)
+        return response
+
+    job = get_kubelogin_job(job_id)
+    if not job:
+        session.pop(KUBELOGIN_JOB_KEY, None)
+        response = JSONResponse(
+            {"status": "error", "message": "kubelogin session has expired"},
+            status_code=410,
+        )
+        handle.commit(response)
+        return response
+
+    if job.is_finished():
+        if job.error:
+            remove_kubelogin_job(job_id)
+            session.pop(KUBELOGIN_JOB_KEY, None)
+            logger.error("kubelogin job %s reported error: %s", job_id, job.error)
+            raise HTTPException(status_code=500, detail=f"kubelogin failed: {job.error}")
+
+        result = job.result
+        if not result:
+            remove_kubelogin_job(job_id)
+            session.pop(KUBELOGIN_JOB_KEY, None)
+            raise HTTPException(status_code=500, detail="kubelogin returned no result")
+
+        token_entry = build_kubelogin_token_entry(result, settings.aks_scope)
+        session[AKS_TOKEN_KEY] = token_entry
+        session.pop(KUBELOGIN_JOB_KEY, None)
+        remove_kubelogin_job(job_id)
+        _log_flow_step(
+            "AKS access token acquired via kubelogin",
+            {
+                "kubelogin_job_id": job_id,
+                "expires_on": token_entry.get("expires_on"),
+            },
+        )
+        response = RedirectResponse(url="/whoami", status_code=302)
+        handle.commit(response)
+        return response
+
+    message = (
+        job.message
+        or job_info.get("message")
+        or "Follow the kubelogin instructions to complete sign-in."
+    )
+    job_info["message"] = message
+    session[KUBELOGIN_JOB_KEY] = job_info
+    response = JSONResponse({"status": "pending", "message": message})
+    handle.commit(response)
+    return response
 
 
 @app.get("/whoami")
@@ -343,6 +447,33 @@ async def whoami(request: Request):
         if not token_entry:
             session.pop(AKS_TOKEN_KEY, None)
             if interaction_error in {"interaction_required", "consent_required"}:
+                if settings.kubelogin_enabled:
+                    try:
+                        job = start_kubelogin_job(user.get("username"))
+                    except KubeloginError as exc:
+                        logger.warning(
+                            "kubelogin fallback failed during refresh: %s", exc
+                        )
+                    else:
+                        message = job.wait_for_message(timeout=5.0)
+                        session[KUBELOGIN_JOB_KEY] = {
+                            "id": job.id,
+                            "created_at": int(time.time()),
+                            "message": message,
+                        }
+                        persist_cache_to_session(cache, session)
+                        _log_flow_step(
+                            "Delegating AKS token refresh to kubelogin",
+                            {
+                                "kubelogin_job_id": job.id,
+                                "login_hint": user.get("username"),
+                            },
+                        )
+                        response = RedirectResponse(
+                            url="/kubelogin/device-code", status_code=302
+                        )
+                        handle.commit(response)
+                        return response
                 raise HTTPException(status_code=401, detail="Additional consent required")
             raise HTTPException(status_code=500, detail="Failed to acquire AKS token")
         session[AKS_TOKEN_KEY] = token_entry
