@@ -23,6 +23,18 @@ The OAuth proxy is a FastAPI service that signs users in with Microsoft Entra us
 - On a first-time login, ID-token claims and account metadata are cached in the session for later silent token acquisition, and the serialised MSAL cache is persisted for subsequent requests.
 - Immediately after redeeming the code, the proxy silently requests an AKS user-scoped token using the stored account. A successful response is written to the session (and the cache saved) before redirecting the user to `/whoami`; if MSAL indicates additional consent is needed, the proxy triggers an incremental-consent redirect using the same PKCE and state protections.
 
+### 3. kubelogin fallback for delegated AKS tokens
+When MSAL cannot mint the AKS token because the tenant requires admin consent, the proxy can offload the acquisition to the Microsoft first-party `kubelogin` client:
+
+1. The callback (or `/whoami` refresh path) receives a `consent_required`/`interaction_required` error while requesting the AKS scope.
+2. The proxy launches `kubelogin get-token --login devicecode --server-id <AKS app> --tenant-id <tenant> --client-id <public client>` in the background and stores the job identifier in the user’s session.
+3. The user is redirected to `/kubelogin/device-code`, which polls the job:
+   * If interaction is required, the endpoint returns the device-code instructions emitted by kubelogin so the user can finish the sign-in at `https://microsoft.com/devicelogin`.
+   * Once kubelogin outputs an ExecCredential payload, the endpoint caches the AKS access token in the session and redirects to `/whoami`.
+4. Later requests reuse the cached kubelogin token until it expires, at which point the proxy either refreshes it silently or starts a new kubelogin job if consent is still unavailable.
+
+Kubelogin jobs are tracked per session; if the job fails or the session expires, `/kubelogin/device-code` responds with an error so the caller can restart the flow from `/login`.
+
 ## Project structure
 ```
 .
@@ -61,6 +73,11 @@ The application reads its configuration exclusively from environment variables. 
 | `SESSION_IDLE_TIMEOUT_SECONDS` | Optional idle timeout in seconds before a session expires (default 30 minutes). |
 | `SESSION_ABSOLUTE_TIMEOUT_SECONDS` | Optional absolute session lifetime in seconds (default 8 hours). |
 | `SESSION_COOKIE_SECURE` / `SESSION_COOKIE_SAMESITE` | Optional flags controlling cookie security attributes. |
+| `KUBELOGIN_ENABLED` | Set to `false` to disable the kubelogin integration (enabled by default). |
+| `KUBELOGIN_BINARY` | Override the kubelogin executable name/path if it is not already on `PATH`. |
+| `KUBELOGIN_LOGIN` | Login mode supplied to kubelogin (defaults to `devicecode`). |
+| `KUBELOGIN_CLIENT_ID` | Public client ID kubelogin should impersonate (defaults to the Microsoft AKS client). |
+| `KUBELOGIN_ENVIRONMENT` | Azure cloud suffix passed to kubelogin (defaults to `AzurePublicCloud`). |
 
 See `app/config.py` for the complete list of supported settings and defaults. 【F:app/config.py†L14-L97】
 
@@ -85,6 +102,21 @@ The response should return `302 Found` with a `Location` header pointing at the 
 ```bash
 curl -b cookies.txt http://localhost:8080/whoami
 ```
+
+### Triggering the kubelogin device-code flow
+If the tenant has not pre-consented to the AKS delegated scope, the proxy falls back to kubelogin after `/callback` or `/whoami` fails to mint the token. To monitor the background job and complete the device-code instructions, call:
+
+```bash
+curl -i -b cookies.txt http://localhost:8080/kubelogin/device-code
+```
+
+The endpoint responds with one of the following:
+
+* `302 Found` – kubelogin already produced an AKS token; follow the redirect to `/whoami` to see the result.
+* `200 OK` with JSON – inspect the returned `message`, complete the device login at `https://microsoft.com/devicelogin`, then poll the endpoint again until the job finishes.
+* `4xx/5xx` – the session expired or kubelogin returned an error; restart from `/login` after addressing the reported issue.
+
+Once kubelogin succeeds, the `/whoami` response will include the user-scoped AKS token sourced from the plug-in, and the proxy will reuse it until it is refreshed or replaced.
 
 ## Container image
 A production-friendly container image can be built from the provided Dockerfile:
